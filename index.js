@@ -17,6 +17,12 @@ const ffmpegPath = require("ffmpeg-static");
 const gTTS = require("gtts");
 const fetch = require("node-fetch");
 
+const OpenAI = require("openai");
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 const client = new Client({
@@ -113,7 +119,7 @@ async function recordAndRespond(connection, message) {
     });
 
     const userStream = receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 1000 },
+      end: { behavior: EndBehaviorType.AfterSilence, duration: 5000 },
     });
 
     userStream.pipe(opusDecoder).pipe(fileStream);
@@ -154,11 +160,11 @@ async function recordAndRespond(connection, message) {
       });
     }
     const fullTranscript = transcriptLines.join("\n");
-    const prompt = `${SYSTEM_PROMPT}${CHANGING_PROMPT}\n\n${fullTranscript}\n\nRespond appropriately.`;
-    const ollamaReply = await askOllama(prompt);
+    const chatGptReply = await askOpenAI(fullTranscript);
 
     const ttsPath = `audio/reply-${Date.now()}.mp3`;
-    const gtts = new gTTS(ollamaReply, 'en');
+    const gtts = new gTTS(chatGptReply, 'en');
+
 
     gtts.save(ttsPath, () => {
       const ttsPlayer = createAudioPlayer();
@@ -195,8 +201,11 @@ function speak(connection, text, lang = 'en') {
   return new Promise((resolve, reject) => {
     const ttsPath = `audio/tts-${Date.now()}.mp3`;
     const gtts = new gTTS(text, lang);
+    console.log(`🗣️ Speaking: ${text}`);
 
     gtts.save(ttsPath, () => {
+      console.log(`📁 Saved TTS audio to ${ttsPath}`);
+
       const ttsPlayer = createAudioPlayer();
       const ttsResource = createAudioResource(ttsPath);
       connection.subscribe(ttsPlayer);
@@ -207,29 +216,33 @@ function speak(connection, text, lang = 'en') {
         resolve();
       });
 
-      ttsPlayer.on("error", reject);
+      ttsPlayer.on("error", (err) => {
+        console.error("🔊 TTS Playback Error:", err);
+        reject(err);
+      });
     });
   });
 }
 
-async function askOllama(promptText) {
+
+async function askOpenAI(promptText) {
   try {
-    const response = await fetch("http://localhost:11434/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "llama3",
-        prompt: promptText,
-        stream: false
-      })
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo", // or "gpt-4"
+      messages: [
+        { role: "system", content: SYSTEM_PROMPT + CHANGING_PROMPT },
+        { role: "user", content: promptText }
+      ],
+      temperature: 0.7
     });
-    const data = await response.json();
-    return data.response;
+
+    return response.choices[0].message.content.trim();
   } catch (error) {
-    console.error("🛑 Ollama error:", error);
-    return "❌ Failed to contact Ollama.";
+    console.error("🛑 OpenAI error:", error.response?.data || error.message);
+    return "❌ Failed to contact OpenAI.";
   }
 }
+
 
 client.login(process.env.DISCORD_TOKEN).then(() => {
   console.log("🔐 Bot login attempt successful.");
