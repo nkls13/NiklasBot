@@ -357,7 +357,7 @@ client.on("messageCreate", async (message) => {
   activeLoops.set(guildId, intervalId);
 });
 
-async function recordAndRespond(connection, message) {
+async function recordAndRespond(connection, guildId, channel) {
   // Reload the changing prompt before each conversation cycle
   reloadChangingPrompt();
   
@@ -366,7 +366,8 @@ async function recordAndRespond(connection, message) {
   console.log("Recording started...");
 
   receiver.speaking.on("start", (userId) => {
-    const user = message.guild.members.cache.get(userId)?.user;
+    const guild = client.guilds.cache.get(guildId);
+    const user = guild?.members.cache.get(userId)?.user;
     if (!user || activeUsers.has(userId)) return;
 
     const username = user.username;
@@ -397,7 +398,7 @@ async function recordAndRespond(connection, message) {
     await speak(connection, "Stopped listening");
     
     // Send visual feedback that processing has started
-    const processingMessage = await message.channel.send({
+    const processingMessage = await channel.send({
       content: `**Processing conversation...**\n` +
                `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
     });
@@ -408,7 +409,7 @@ async function recordAndRespond(connection, message) {
       const wavPath = pcmPath.replace(".pcm", ".wav");
 
       await new Promise((resolve) => {
-        exec(`ffmpeg -y -f s16le -ar 48000 -ac 2 -i ${pcmPath} -ar 16000 -ac 1 ${wavPath}`, (err) => {
+        exec(`"${ffmpegPath}" -y -f s16le -ar 48000 -ac 2 -i ${pcmPath} -ar 16000 -ac 1 ${wavPath}`, (err) => {
           if (err || !fs.existsSync(wavPath)) {
             console.error(`FFmpeg failed for ${username}:`, err);
             // Clean up files even on failure
@@ -433,7 +434,7 @@ async function recordAndRespond(connection, message) {
       });
     }
     const fullTranscript = transcriptLines.join("\n");
-    const chatGptReply = await askOpenAI(fullTranscript, message.guild.id);
+    const chatGptReply = await askOpenAI(fullTranscript, guildId);
 
     // Update processing message to show completion
     if (processingMessage) {
@@ -1028,16 +1029,25 @@ client.on('interactionCreate', async interaction => {
       voiceMemory.set(guildId, []);
 
       // Create visual feedback for joining the call
-      const joinMessage = await interaction.reply({
+      await interaction.reply({
         content: `🎤 **Nikbot joined the voice call!**\n` +
                  `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
                  `🔊 **Listening for conversations...**\n` +
                  `⏱️ Recording every ${settings.repeatInterval / 1000} seconds\n` +
                  `🧠 **Session memory enabled**\n` +
                  `🛑 Type \`stop\` to end the session\n` +
-                 `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
-        fetchReply: true
+                 `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
       });
+
+      // Get the reply message for the channel reference
+      const joinMessage = await interaction.fetchReply();
+
+      // Start recording immediately
+      try {
+        await recordAndRespond(connection, guildId, joinMessage.channel);
+      } catch (error) {
+        console.error("Initial recording error:", error);
+      }
 
       // Start the recording loop
       const loop = setInterval(async () => {
