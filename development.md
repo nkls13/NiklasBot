@@ -2,7 +2,7 @@
 
 ## Current State
 
-A single-file Discord bot in `index.js` with voice AI, text chat, and Fortnite integration. Runs on Node.js. Uses Groq (free tier) for chat and transcription, OpenAI for TTS.
+A single-file Discord bot in `index.js` with ambient voice AI, text chat, and Fortnite integration. Runs on Node.js. Uses Groq (free tier) for chat and transcription, OpenAI for TTS.
 
 ---
 
@@ -12,7 +12,15 @@ A single-file Discord bot in `index.js` with voice AI, text chat, and Fortnite i
 
 **#2 Python subprocess for Whisper** — Replaced with Groq `whisper-large-v3-turbo` API. No Python dependency.
 
-**#4 Global settings** — Replaced with per-guild `guildSettings.json`. `/setrecord` and `/setrepeat` are now server-scoped.
+**#3 Fixed-interval recording / no VAD** — Replaced the fixed-timer record/respond loop with continuous per-utterance listening (`receiver.speaking` start/end drives capture; `EndBehaviorType.AfterSilence` ends each person's utterance after ~1.3s instead of a flat 5s batch window). Two reply triggers share one output gate:
+  - **Addressed** — fires after every finished utterance; responds immediately if the model judges it was talked to, else returns the literal token `SILENT` and nothing plays.
+  - **Lull** — polled every 2s; only fires once the whole channel's been quiet for `lullThresholdMs` (per-guild, `/setpatience`, default 9s) and a 25s ambient cooldown has passed since the last unprompted comment. Heavily biased toward silence (see `prompt.txt`).
+  - **Output gate** (`speakWhenClear`) — holds any reply until nobody's currently speaking (max 8s wait), so Nikbot doesn't talk over people.
+  - **Barge-in** — if anyone starts talking while Nikbot is mid-reply, its `AudioPlayer` is stopped immediately.
+
+  `/setrecord` and `/setrepeat` are gone, replaced by the single `/setpatience` (lull threshold) setting — there's no more fixed recording window to configure.
+
+**#4 Global settings** — Replaced with per-guild `guildSettings.json`. `/setpatience` is server-scoped.
 
 **#6 Dual command system** — All `!` prefix commands removed. Slash commands only.
 
@@ -26,15 +34,14 @@ A single-file Discord bot in `index.js` with voice AI, text chat, and Fortnite i
 
 **#12 No rate limiting** — Added 5-second per-user cooldown on `/message-nikbot` with ephemeral feedback.
 
+**#16 README out of sync** — Rewritten to match the current command set and ambient-listening behavior.
+
 ---
 
 ### ❌ Remaining
 
 **#1 Monolithic index.js** *(critical)*
 Everything still lives in one file. Phase 1 refactor (extract services, commands, events into `src/`) is deferred until other features stabilize.
-
-**#3 Fixed-interval recording / no VAD** *(critical)*
-Bot still polls on a fixed timer rather than listening continuously. VAD via `EndBehaviorType.AfterSilence` would make voice chat feel real-time. This is the next high-impact change.
 
 **#5 In-memory text history resets on restart** *(critical)*
 `textMemory` Map is lost on every restart. Needs SQLite persistence via `better-sqlite3`.
@@ -51,8 +58,8 @@ All output is `console.log`. Add `pino` for log levels and timestamps when cloud
 **#15 Stale voice memory on crash** *(minor)*
 Voice memory is cleared on clean stop but not on crash. Low priority since voice memory is intentionally session-scoped.
 
-**#16 README out of sync** *(minor)*
-README still references Python, `gtts`, and prefix commands. Update after VAD is done so it reflects the final UX.
+**#17 Ambient reply cadence is untuned** *(needs real testing)*
+`lullThresholdMs` (9s default), `AMBIENT_COOLDOWN_MS` (25s), and `PER_USER_SILENCE_MS` (1.3s) are reasonable starting guesses, not measured. The "should I say something" prompting in `prompt.txt` also hasn't been tested live — expect it to need iteration once there's an actual multi-person call to test against (too chatty / too quiet / wrong moments).
 
 ---
 
@@ -64,8 +71,8 @@ README still references Python, `gtts`, and prefix commands. Update after VAD is
 | 3 | Replace Python transcription | ✅ Done |
 | 4 | Replace gtts with OpenAI TTS | ✅ Done |
 | 5 | Slash commands only | ✅ Done |
+| 6 | Continuous listening + ambient replies | ✅ Done (untuned — see #17) |
 | 1 | Modular src/ structure | ❌ Pending |
-| 6 | Voice Activity Detection | ❌ Next |
 
 ---
 
@@ -73,13 +80,16 @@ README still references Python, `gtts`, and prefix commands. Update after VAD is
 
 ### Short Term — Next Up
 
-**Voice Activity Detection (VAD)**
-Replace fixed-interval polling with continuous listening. Bot records each user until 1.5s of silence, then responds immediately. Eliminates the 2-minute repeat loop entirely. Uses the existing `EndBehaviorType.AfterSilence` that's already imported.
+**Live-tune ambient cadence (#17)**
+Test in an actual call with multiple people; adjust `lullThresholdMs`, `AMBIENT_COOLDOWN_MS`, and the `prompt.txt` silence bias based on how it actually feels.
 
 **Persistent text memory (SQLite)**
 Use `better-sqlite3` to persist `textMemory` across restarts. Schema: `(guild_id, role, content, timestamp)`. Same 20-exchange window, survives restarts.
 
 ### Medium Term
+
+**Custom voice (cheap + fast)**
+Currently OpenAI `tts-1` with a fixed voice. Cartesia Sonic is the cheapest low-latency option with real voice cloning if/when a custom voice becomes a priority — parked for now by choice, not a technical blocker.
 
 **Web dashboard**
 Simple Express status page: active guilds, current prompts, memory counts. Add controls later.
@@ -132,4 +142,4 @@ FORTNITE_API_KEY=       # Optional (fortnite-api.com)
 
 ## Hosting Notes
 
-Oracle VM compatibility is maintained via `safeDeleteFile`, pre-created `audio/` directory, and the 10-minute orphaned file cleanup interval. Keep these regardless of host.
+Oracle VM compatibility is maintained via `safeDeleteFile`, pre-created `audio/` directory, and the 10-minute orphaned file cleanup interval. Keep these regardless of host. Not a priority right now — testing locally against Discord first, hosting decision deferred until the bot's behavior is solid.

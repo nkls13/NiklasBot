@@ -98,14 +98,15 @@ function saveGuildPrompts() {
 }
 
 // --- Per-guild settings ---
-const DEFAULT_SETTINGS = { recordDuration: 10000, repeatInterval: 120000 };
+// lullThresholdMs: how long the whole channel must be quiet before Nikbot
+// considers chiming in unprompted. Being directly addressed bypasses this.
+const DEFAULT_SETTINGS = { lullThresholdMs: 9000 };
 const guildSettings = new Map();
 
 function getGuildSettings(guildId) {
   const s = guildSettings.get(guildId) || {};
   return {
-    recordDuration: (s.recordDuration > 0) ? s.recordDuration : DEFAULT_SETTINGS.recordDuration,
-    repeatInterval: (s.repeatInterval > 0) ? s.repeatInterval : DEFAULT_SETTINGS.repeatInterval,
+    lullThresholdMs: (s.lullThresholdMs > 0) ? s.lullThresholdMs : DEFAULT_SETTINGS.lullThresholdMs,
   };
 }
 
@@ -160,128 +161,278 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-const activeLoops = new Map();
-const voiceMemory = new Map();
+// --- Voice session state ---
+// One entry per guild currently in a call. Replaces the old fixed-interval
+// recording loop: listening is continuous and event-driven instead.
+const voiceSessions = new Map();
 const textMemory = new Map();
 const textCooldowns = new Map(); // userId -> last used timestamp
 
 const TEXT_COOLDOWN_MS = 5000;
+const PER_USER_SILENCE_MS = 1300;   // pause length that ends one person's utterance
+const LULL_CHECK_INTERVAL_MS = 2000; // how often to check for dead air
+const AMBIENT_COOLDOWN_MS = 25000;  // minimum gap between two unprompted comments
+const MAX_SPEAK_WAIT_MS = 8000;     // give up waiting for quiet and speak anyway
+const TRANSCRIPT_MAX_LINES = 40;    // rolling transcript kept per session (human lines + Nikbot's own)
+const SILENT_TOKEN = "SILENT";
+
+function createVoiceSession(connection) {
+  return {
+    connection,
+    transcript: [],            // { speaker, text, ts }
+    speakingUsers: new Set(),  // userIds currently talking right now
+    activeRecordings: new Set(), // userIds mid-utterance capture
+    lastActivityAt: Date.now(),
+    lastAmbientAt: 0,
+    processing: false,
+    ttsPlayer: null,
+    lullWatcher: null,
+  };
+}
+
+function teardownVoiceSession(guildId) {
+  const session = voiceSessions.get(guildId);
+  if (session?.lullWatcher) clearInterval(session.lullWatcher);
+  voiceSessions.delete(guildId);
+}
 
 // messageCreate is only used to handle the "stop" keyword
 client.on("messageCreate", async (message) => {
   if (message.author.bot) return;
   const guildId = message.guild?.id;
 
-  if (/stop/i.test(message.content) && activeLoops.has(guildId)) {
-    clearInterval(activeLoops.get(guildId));
-    activeLoops.delete(guildId);
-    voiceMemory.delete(guildId);
+  if (/stop/i.test(message.content) && voiceSessions.has(guildId)) {
+    teardownVoiceSession(guildId);
 
     const connection = getVoiceConnection(guildId);
     if (connection) connection.destroy();
 
-    message.channel.send("Stopped recording loop and left the voice channel. Voice memory cleared.");
+    message.channel.send("Stopped listening and left the voice channel. Voice memory cleared.");
   }
 });
 
-async function recordAndRespond(connection, guildId, channel) {
-  // Reload the changing prompt before each cycle in case it was updated on disk
+// Starts continuous listening for a guild's call: every user's speech is
+// captured as its own utterance (no fixed window), transcribed as soon as
+// they pause, and fed into one of two reply triggers — direct address
+// (immediate) or dead-air ambient commentary (patient). Both triggers route
+// through speakWhenClear() so Nikbot never starts talking over someone, and
+// an active reply is cut off immediately if anyone starts speaking (barge-in).
+function startListening(connection, guildId) {
   try { CHANGING_PROMPT = fs.readFileSync("changingPrompt.txt", "utf-8").trim(); } catch {}
 
-  const { recordDuration } = getGuildSettings(guildId);
+  const session = createVoiceSession(connection);
+  voiceSessions.set(guildId, session);
+
   const receiver = connection.receiver;
-  const activeUsers = new Map();
-  console.log("Recording started...");
 
-  receiver.speaking.on("start", async (userId) => {
-    console.log(`🎤 Speaking event for userId: ${userId}`);
-    if (activeUsers.has(userId)) return;
+  receiver.speaking.on("start", (userId) => {
+    session.speakingUsers.add(userId);
+    session.lastActivityAt = Date.now();
 
-    let username = userId;
-    try {
-      const user = await client.users.fetch(userId);
-      username = user.username;
-    } catch (e) {
-      console.error(`Could not fetch username for ${userId}:`, e.message);
+    // Barge-in: anyone talking cuts off whatever Nikbot is currently saying.
+    if (session.ttsPlayer) {
+      try { session.ttsPlayer.stop(); } catch {}
     }
 
-    const pcmPath = `audio/${username}-${Date.now()}.pcm`;
-    const fileStream = fs.createWriteStream(pcmPath);
+    if (session.activeRecordings.has(userId)) return; // already capturing this person
+    beginUserRecording(guildId, userId).catch(e => console.error("beginUserRecording error:", e));
+  });
 
-    const opusDecoder = new prism.opus.Decoder({
-      rate: 48000,
-      channels: 2,
-      frameSize: 960,
-    });
+  receiver.speaking.on("end", (userId) => {
+    session.speakingUsers.delete(userId);
+  });
 
-    const userStream = receiver.subscribe(userId, {
-      end: { behavior: EndBehaviorType.AfterSilence, duration: 5000 },
-    });
+  session.lullWatcher = setInterval(() => {
+    checkForLull(guildId).catch(e => console.error("checkForLull error:", e));
+  }, LULL_CHECK_INTERVAL_MS);
 
-    userStream.pipe(opusDecoder).pipe(fileStream);
-    activeUsers.set(userId, { username, fileStream, pcmPath });
+  console.log(`✅ Listening continuously in guild ${guildId}`);
+}
 
-    fileStream.on("finish", () => {
-      console.log(`Finished writing for ${username}`);
+async function beginUserRecording(guildId, userId) {
+  const session = voiceSessions.get(guildId);
+  if (!session) return;
+  session.activeRecordings.add(userId);
+
+  let username = userId;
+  try {
+    const user = await client.users.fetch(userId);
+    username = user.username;
+  } catch (e) {
+    console.error(`Could not fetch username for ${userId}:`, e.message);
+  }
+
+  const pcmPath = `audio/${username}-${Date.now()}.pcm`;
+  const fileStream = fs.createWriteStream(pcmPath);
+  const opusDecoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+
+  const userStream = session.connection.receiver.subscribe(userId, {
+    end: { behavior: EndBehaviorType.AfterSilence, duration: PER_USER_SILENCE_MS },
+  });
+
+  userStream.pipe(opusDecoder).pipe(fileStream);
+
+  fileStream.on("finish", () => {
+    session.activeRecordings.delete(userId);
+    finalizeUtterance(guildId, username, pcmPath).catch(e => console.error("finalizeUtterance error:", e));
+  });
+}
+
+async function finalizeUtterance(guildId, username, pcmPath) {
+  const wavPath = pcmPath.replace(".pcm", ".wav");
+
+  const converted = await new Promise((resolve) => {
+    exec(`"${ffmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${pcmPath}" -ar 16000 -ac 1 "${wavPath}"`, (err) => {
+      resolve(!err && fs.existsSync(wavPath));
     });
   });
 
-  setTimeout(async () => {
-    receiver.speaking.removeAllListeners("start");
+  if (!converted) {
+    console.error(`FFmpeg failed for ${username}`);
+    safeDeleteFile(wavPath, "failed WAV file");
+    safeDeleteFile(pcmPath, "failed PCM file");
+    return;
+  }
 
-    if (activeUsers.size === 0) {
-      console.log("No speech detected this cycle — skipping.");
-      return;
-    }
+  let text = "";
+  try {
+    text = await transcribeAudio(wavPath);
+  } catch (e) {
+    console.error(`Transcription failed for ${username}:`, e.message);
+  } finally {
+    safeDeleteFile(wavPath, "processed WAV file");
+    safeDeleteFile(pcmPath, "processed PCM file");
+  }
 
-    try { await speak(connection, "Got it, one moment."); }
-    catch (e) { console.error("❌ TTS error:", e.message); }
+  text = text.trim();
+  if (!text) return;
+  console.log(`Transcribed ${username}: "${text}"`);
 
-    console.log(`Transcribing ${activeUsers.size} user(s)...`);
+  const session = voiceSessions.get(guildId);
+  if (!session) return; // session ended while we were transcribing
 
-    const transcriptLines = [];
+  session.transcript.push({ speaker: username, text, ts: Date.now() });
+  if (session.transcript.length > TRANSCRIPT_MAX_LINES) {
+    session.transcript.splice(0, session.transcript.length - TRANSCRIPT_MAX_LINES);
+  }
+  session.lastActivityAt = Date.now();
 
-    for (const [userId, { username, pcmPath }] of activeUsers.entries()) {
-      const wavPath = pcmPath.replace(".pcm", ".wav");
+  await maybeRespondToAddress(guildId);
+}
 
-      await new Promise((resolve) => {
-        exec(`"${ffmpegPath}" -y -f s16le -ar 48000 -ac 2 -i "${pcmPath}" -ar 16000 -ac 1 "${wavPath}"`, async (err) => {
-          if (err || !fs.existsSync(wavPath)) {
-            console.error(`FFmpeg failed for ${username}:`, err);
-            safeDeleteFile(wavPath, "failed WAV file");
-            safeDeleteFile(pcmPath, "failed PCM file");
-            resolve();
-            return;
-          }
-          try {
-            const transcription = await transcribeAudio(wavPath);
-            console.log(`Transcribed ${username}: "${transcription}"`);
-            transcriptLines.push(`[${username}]: ${transcription}`);
-          } catch (e) {
-            console.error(`Transcription failed for ${username}:`, e);
-          } finally {
-            safeDeleteFile(wavPath, "processed WAV file");
-            safeDeleteFile(pcmPath, "processed PCM file");
-            resolve();
-          }
-        });
-      });
-    }
+function formatTranscript(session, maxEntries = 16) {
+  return session.transcript.slice(-maxEntries).map(l => `${l.speaker}: ${l.text}`).join("\n");
+}
 
-    const fullTranscript = transcriptLines.join("\n");
-    if (!fullTranscript.trim()) {
-      console.log("Transcription empty — skipping AI response.");
-      return;
-    }
+function isSilent(reply) {
+  return reply.trim().replace(/[.!"'`]+$/g, "").toUpperCase() === SILENT_TOKEN;
+}
 
-    console.log("Sending to AI...");
-    const chatGptReply = await askOpenAI(fullTranscript, guildId);
-    console.log(`AI response: "${chatGptReply}"`);
+// Records what Nikbot said back into the same rolling transcript everything
+// else lives in, so its own prior remarks are part of the context for the
+// next call — no separate chat-history store to keep in sync.
+function recordOwnReply(session, text) {
+  session.transcript.push({ speaker: "Nikbot", text, ts: Date.now() });
+  if (session.transcript.length > TRANSCRIPT_MAX_LINES) {
+    session.transcript.splice(0, session.transcript.length - TRANSCRIPT_MAX_LINES);
+  }
+}
 
-    try { await speak(connection, chatGptReply); }
-    catch (e) { console.error("❌ TTS error (response):", e.message); }
+// Single model call shared by both reply triggers — situationNote tells the
+// model which mode it's in (addressed vs. ambient) and that SILENT is a
+// valid, expected answer. The rolling transcript (human speech + Nikbot's
+// own past replies) is the only context — no separate memory store.
+async function callVoiceModel(guildId, situationNote) {
+  const session = voiceSessions.get(guildId);
+  const guildChangingPrompt = guildChangingPrompts.get(guildId) || CHANGING_PROMPT;
 
-  }, recordDuration);
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT + guildChangingPrompt },
+    { role: "user", content: `${situationNote}\n\nRecent conversation:\n${formatTranscript(session)}` }
+  ];
+
+  const response = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    messages,
+    temperature: 0.7
+  });
+
+  return response.choices[0].message.content.trim().replace(/^Nikbot:\s*/i, '');
+}
+
+// Fast path: fires after every finished utterance. Responds immediately if
+// directly addressed, otherwise stays silent (the lull watcher handles
+// unprompted commentary instead).
+async function maybeRespondToAddress(guildId) {
+  const session = voiceSessions.get(guildId);
+  if (!session || session.processing) return;
+
+  session.processing = true;
+  try {
+    const reply = await callVoiceModel(
+      guildId,
+      `Someone just finished speaking. If they were directly addressing you, respond now. ` +
+      `If not, reply with exactly "${SILENT_TOKEN}" and nothing else.`
+    );
+    if (isSilent(reply)) return;
+
+    console.log(`AI response (addressed): "${reply}"`);
+    recordOwnReply(session, reply);
+    await speakWhenClear(guildId, reply);
+    session.lastAmbientAt = Date.now();
+  } finally {
+    session.processing = false;
+  }
+}
+
+// Patient path: polled on a timer, only acts once the whole channel has been
+// quiet for lullThresholdMs and an ambient cooldown has passed. Heavily
+// biased toward staying silent — see prompt.txt.
+async function checkForLull(guildId) {
+  const session = voiceSessions.get(guildId);
+  if (!session || session.processing) return;
+  if (session.speakingUsers.size > 0) return;
+  if (session.transcript.length === 0) return;
+
+  const { lullThresholdMs } = getGuildSettings(guildId);
+  if (Date.now() - session.lastActivityAt < lullThresholdMs) return;
+  if (Date.now() - session.lastAmbientAt < AMBIENT_COOLDOWN_MS) return;
+
+  session.processing = true;
+  try {
+    const reply = await callVoiceModel(
+      guildId,
+      `There's been a lull — nobody has spoken in a while. Only say something if you genuinely ` +
+      `have something worth adding; staying quiet is the default and usually correct. If you have ` +
+      `nothing worth adding, reply with exactly "${SILENT_TOKEN}" and nothing else.`
+    );
+    session.lastAmbientAt = Date.now();
+    if (isSilent(reply)) return;
+
+    console.log(`AI response (ambient): "${reply}"`);
+    recordOwnReply(session, reply);
+    await speakWhenClear(guildId, reply);
+  } finally {
+    session.processing = false;
+  }
+}
+
+// Holds a reply until the whole channel is quiet (or MAX_SPEAK_WAIT_MS
+// elapses) so Nikbot never starts talking over someone mid-sentence.
+async function speakWhenClear(guildId, text) {
+  const session = voiceSessions.get(guildId);
+  if (!session) return;
+
+  const start = Date.now();
+  while (session.speakingUsers.size > 0 && Date.now() - start < MAX_SPEAK_WAIT_MS) {
+    await new Promise(r => setTimeout(r, 250));
+  }
+
+  try {
+    await speak(session.connection, text, session);
+  } catch (e) {
+    console.error("❌ TTS error:", e.message);
+  }
 }
 
 async function transcribeAudio(audioPath) {
@@ -293,7 +444,10 @@ async function transcribeAudio(audioPath) {
   return transcription.text;
 }
 
-async function speak(connection, text) {
+// session is optional — when passed, its ttsPlayer is tracked so the
+// channel-wide barge-in listener in startListening() can stop playback
+// the instant someone starts talking.
+async function speak(connection, text, session = null) {
   const ttsPath = `audio/tts-${Date.now()}.mp3`;
   console.log(`Speaking: ${text}`);
 
@@ -310,49 +464,23 @@ async function speak(connection, text) {
     const ttsPlayer = createAudioPlayer();
     const ttsResource = createAudioResource(ttsPath);
     connection.subscribe(ttsPlayer);
+    if (session) session.ttsPlayer = ttsPlayer;
     ttsPlayer.play(ttsResource);
 
+    const clearSession = () => { if (session && session.ttsPlayer === ttsPlayer) session.ttsPlayer = null; };
+
     ttsPlayer.on(AudioPlayerStatus.Idle, () => {
+      clearSession();
       safeDeleteFile(ttsPath, "TTS audio file");
       resolve();
     });
 
     ttsPlayer.on("error", (err) => {
+      clearSession();
       console.error("TTS Playback Error:", err);
       reject(err);
     });
   });
-}
-
-async function askOpenAI(promptText, guildId) {
-  try {
-    const memory = voiceMemory.get(guildId) || [];
-    const guildChangingPrompt = guildChangingPrompts.get(guildId) || CHANGING_PROMPT;
-
-    const messages = [
-      { role: "system", content: SYSTEM_PROMPT + guildChangingPrompt },
-      ...memory.slice(-10),
-      { role: "user", content: promptText }
-    ];
-
-    const response = await groq.chat.completions.create({
-      model: "llama-3.3-70b-versatile",
-      messages,
-      temperature: 0.7
-    });
-
-    let botResponse = response.choices[0].message.content.trim().replace(/^Nikbot:\s*/i, '');
-
-    memory.push({ role: "user", content: promptText });
-    memory.push({ role: "assistant", content: botResponse });
-    if (memory.length > 40) memory.splice(0, memory.length - 40);
-    voiceMemory.set(guildId, memory);
-
-    return botResponse;
-  } catch (error) {
-    console.error("Groq error:", error.response?.data || error.message);
-    return "Failed to contact Groq.";
-  }
 }
 
 async function askOpenAIText(promptText, guildId) {
@@ -575,30 +703,16 @@ const SLASH_COMMANDS = [
     description: 'Show current bot settings and memory status'
   },
   {
-    name: 'setrecord',
-    description: 'Set recording duration in seconds (per-server)',
+    name: 'setpatience',
+    description: 'Seconds of dead air before Nikbot might chime in unprompted (per-server)',
     options: [
       {
         name: 'seconds',
-        description: 'Recording duration in seconds',
+        description: 'Seconds of silence before considering an unprompted comment',
         type: 4,
         required: true,
-        min_value: 5,
+        min_value: 3,
         max_value: 60
-      }
-    ]
-  },
-  {
-    name: 'setrepeat',
-    description: 'Set repeat interval in seconds (per-server)',
-    options: [
-      {
-        name: 'seconds',
-        description: 'Repeat interval in seconds',
-        type: 4,
-        required: true,
-        min_value: 120,
-        max_value: 500
       }
     ]
   },
@@ -686,9 +800,7 @@ client.on('interactionCreate', async interaction => {
           return;
         }
         // Stale/disconnected connection — destroy it and re-join
-        clearInterval(activeLoops.get(guildId));
-        activeLoops.delete(guildId);
-        voiceMemory.delete(guildId);
+        teardownVoiceSession(guildId);
         try { existingConnection.destroy(); } catch {}
       }
 
@@ -710,8 +822,7 @@ client.on('interactionCreate', async interaction => {
         selfDeaf: false,
       });
 
-      voiceMemory.set(guildId, []);
-      const { repeatInterval } = getGuildSettings(guildId);
+      const { lullThresholdMs } = getGuildSettings(guildId);
 
       // Auto-reconnect on unexpected disconnect
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -724,9 +835,7 @@ client.on('interactionCreate', async interaction => {
           console.log(`🔄 Reconnected to voice in guild ${guildId}`);
         } catch {
           console.log(`❌ Could not reconnect in guild ${guildId}, cleaning up`);
-          clearInterval(activeLoops.get(guildId));
-          activeLoops.delete(guildId);
-          voiceMemory.delete(guildId);
+          teardownVoiceSession(guildId);
           try { connection.destroy(); } catch {}
           try {
             channel.send("Voice connection lost and could not reconnect. Use `/joincall` to start a new session.");
@@ -739,8 +848,8 @@ client.on('interactionCreate', async interaction => {
           await interaction.editReply({
             content: `**Nikbot joined the voice call!**\n` +
                      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-                     `**Listening for conversations...**\n` +
-                     `Recording every ${repeatInterval / 1000} seconds\n` +
+                     `**Listening continuously — jump in anytime**\n` +
+                     `Replies right away when addressed by name; otherwise only chimes in after ~${lullThresholdMs / 1000}s of dead air\n` +
                      `**Session memory enabled**\n` +
                      `Type \`stop\` or \`/leavecall\` to end the session\n` +
                      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
@@ -750,18 +859,7 @@ client.on('interactionCreate', async interaction => {
         }
       }
 
-      const startSession = () => {
-        console.log(`✅ Voice connection Ready for guild ${guildId} — starting recording`);
-        recordAndRespond(connection, guildId, channel).catch(e => console.error("Initial recording error:", e));
-        const loop = setInterval(async () => {
-          try {
-            await recordAndRespond(connection, guildId, channel);
-          } catch (error) {
-            console.error("Recording loop error:", error);
-          }
-        }, getGuildSettings(guildId).repeatInterval);
-        activeLoops.set(guildId, loop);
-      };
+      const startSession = () => startListening(connection, guildId);
 
       if (connection.state.status === VoiceConnectionStatus.Ready) {
         startSession();
@@ -776,9 +874,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply("I'm not in a voice channel.");
         return;
       }
-      clearInterval(activeLoops.get(guildId));
-      activeLoops.delete(guildId);
-      voiceMemory.delete(guildId);
+      teardownVoiceSession(guildId);
       try { conn.destroy(); } catch {}
       await interaction.reply("Left the voice channel. Session memory cleared.");
     }
@@ -801,8 +897,7 @@ client.on('interactionCreate', async interaction => {
         `**Game:**\n` +
         `• \`/fortnite\` - Get latest Fortnite cosmetics\n\n` +
         `**Settings (per-server):**\n` +
-        `• \`/setrecord seconds:<5-60>\` - Set recording duration\n` +
-        `• \`/setrepeat seconds:<120-500>\` - Set repeat interval\n` +
+        `• \`/setpatience seconds:<3-60>\` - Dead air before an unprompted comment\n` +
         `• \`/setprompt prompt:<text>\` - Update voice personality\n` +
         `• \`/currentprompt\` - Show current voice personality\n` +
         `• \`/settings\` - View current settings\n\n` +
@@ -814,33 +909,27 @@ client.on('interactionCreate', async interaction => {
     }
 
     else if (commandName === 'settings') {
-      const voiceMem = voiceMemory.get(guildId) || [];
+      const voiceSession = voiceSessions.get(guildId);
       const textMem = textMemory.get(guildId) || [];
-      const { recordDuration, repeatInterval } = getGuildSettings(guildId);
+      const { lullThresholdMs } = getGuildSettings(guildId);
 
       const settingsMessage = `**Nikbot Settings**\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
-        `**Recording (this server):**\n` +
-        `• Record Duration: ${recordDuration / 1000}s\n` +
-        `• Repeat Interval: ${repeatInterval / 1000}s\n\n` +
+        `**Voice (this server):**\n` +
+        `• Patience before unprompted comment: ${lullThresholdMs / 1000}s\n` +
+        `• Always responds immediately when addressed by name\n\n` +
         `**Memory:**\n` +
-        `• Voice: ${voiceMem.length} messages (clears on exit)\n` +
+        `• Voice: ${voiceSession ? voiceSession.transcript.length : 0} lines (clears on exit)\n` +
         `• Text: ${textMem.length} messages (last 20 exchanges)\n\n` +
-        `**Voice Loop:** ${activeLoops.has(guildId) ? 'Active' : 'Inactive'}\n` +
+        `**Voice Session:** ${voiceSession ? 'Active' : 'Inactive'}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
       await interaction.reply(settingsMessage);
     }
 
-    else if (commandName === 'setrecord') {
+    else if (commandName === 'setpatience') {
       const seconds = options.getInteger('seconds');
-      setGuildSetting(guildId, 'recordDuration', seconds * 1000);
-      await interaction.reply(`✅ Recording duration set to ${seconds} seconds for this server`);
-    }
-
-    else if (commandName === 'setrepeat') {
-      const seconds = options.getInteger('seconds');
-      setGuildSetting(guildId, 'repeatInterval', seconds * 1000);
-      await interaction.reply(`✅ Repeat interval set to ${seconds} seconds for this server`);
+      setGuildSetting(guildId, 'lullThresholdMs', seconds * 1000);
+      await interaction.reply(`✅ Patience set to ${seconds}s of dead air before an unprompted comment, for this server`);
     }
 
     else if (commandName === 'setprompt') {
