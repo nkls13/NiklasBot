@@ -22,6 +22,10 @@ audio/
 # Settings and data files
 settings.json
 guildPrompts.json
+guildSettings.json
+
+# Claude Code local session state
+.claude/
 
 # OS generated files
 .DS_Store
