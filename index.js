@@ -19,6 +19,8 @@ const ffmpegPath = require("ffmpeg-static");
 process.env.FFMPEG_PATH = ffmpegPath; // prism-media / @discordjs/voice use this env var to find ffmpeg
 
 const OpenAI = require("openai");
+const { resolveSettings } = require("./lib/settings");
+const { SILENT_TOKEN, isSilent, formatTranscript, pushTranscriptEntry } = require("./lib/voiceReply");
 
 // OpenAI is used only for TTS (tts-1)
 const openai = new OpenAI({
@@ -100,14 +102,11 @@ function saveGuildPrompts() {
 // --- Per-guild settings ---
 // lullThresholdMs: how long the whole channel must be quiet before Nikbot
 // considers chiming in unprompted. Being directly addressed bypasses this.
-const DEFAULT_SETTINGS = { lullThresholdMs: 9000 };
+// Default-filling logic lives in lib/settings.js so it's unit testable.
 const guildSettings = new Map();
 
 function getGuildSettings(guildId) {
-  const s = guildSettings.get(guildId) || {};
-  return {
-    lullThresholdMs: (s.lullThresholdMs > 0) ? s.lullThresholdMs : DEFAULT_SETTINGS.lullThresholdMs,
-  };
+  return resolveSettings(guildSettings.get(guildId));
 }
 
 function setGuildSetting(guildId, key, value) {
@@ -121,7 +120,7 @@ function loadGuildSettings() {
     if (fs.existsSync("guildSettings.json")) {
       const saved = JSON.parse(fs.readFileSync("guildSettings.json", "utf-8"));
       for (const [guildId, s] of Object.entries(saved)) {
-        guildSettings.set(guildId, { ...DEFAULT_SETTINGS, ...s });
+        guildSettings.set(guildId, s); // getGuildSettings() fills in defaults on read
       }
       console.log(`⚙️ Loaded settings for ${Object.keys(saved).length} guilds`);
     }
@@ -174,7 +173,6 @@ const LULL_CHECK_INTERVAL_MS = 2000; // how often to check for dead air
 const AMBIENT_COOLDOWN_MS = 25000;  // minimum gap between two unprompted comments
 const MAX_SPEAK_WAIT_MS = 8000;     // give up waiting for quiet and speak anyway
 const TRANSCRIPT_MAX_LINES = 40;    // rolling transcript kept per session (human lines + Nikbot's own)
-const SILENT_TOKEN = "SILENT";
 
 function createVoiceSession(connection) {
   return {
@@ -311,31 +309,17 @@ async function finalizeUtterance(guildId, username, pcmPath) {
   const session = voiceSessions.get(guildId);
   if (!session) return; // session ended while we were transcribing
 
-  session.transcript.push({ speaker: username, text, ts: Date.now() });
-  if (session.transcript.length > TRANSCRIPT_MAX_LINES) {
-    session.transcript.splice(0, session.transcript.length - TRANSCRIPT_MAX_LINES);
-  }
+  pushTranscriptEntry(session.transcript, { speaker: username, text, ts: Date.now() }, TRANSCRIPT_MAX_LINES);
   session.lastActivityAt = Date.now();
 
   await maybeRespondToAddress(guildId);
-}
-
-function formatTranscript(session, maxEntries = 16) {
-  return session.transcript.slice(-maxEntries).map(l => `${l.speaker}: ${l.text}`).join("\n");
-}
-
-function isSilent(reply) {
-  return reply.trim().replace(/[.!"'`]+$/g, "").toUpperCase() === SILENT_TOKEN;
 }
 
 // Records what Nikbot said back into the same rolling transcript everything
 // else lives in, so its own prior remarks are part of the context for the
 // next call — no separate chat-history store to keep in sync.
 function recordOwnReply(session, text) {
-  session.transcript.push({ speaker: "Nikbot", text, ts: Date.now() });
-  if (session.transcript.length > TRANSCRIPT_MAX_LINES) {
-    session.transcript.splice(0, session.transcript.length - TRANSCRIPT_MAX_LINES);
-  }
+  pushTranscriptEntry(session.transcript, { speaker: "Nikbot", text, ts: Date.now() }, TRANSCRIPT_MAX_LINES);
 }
 
 // Single model call shared by both reply triggers — situationNote tells the
@@ -348,7 +332,7 @@ async function callVoiceModel(guildId, situationNote) {
 
   const messages = [
     { role: "system", content: SYSTEM_PROMPT + guildChangingPrompt },
-    { role: "user", content: `${situationNote}\n\nRecent conversation:\n${formatTranscript(session)}` }
+    { role: "user", content: `${situationNote}\n\nRecent conversation:\n${formatTranscript(session.transcript)}` }
   ];
 
   const response = await groq.chat.completions.create({

@@ -9,7 +9,7 @@ See `AUTOMATION.md` for the protocol a scheduled run follows. See `DECISIONS.md`
 
 ## Now
 
-- [ ] [locked] Test baseline — `node --test` runner; extract `isSilent`/`formatTranscript`/`pushTranscriptEntry`/settings-resolution into `lib/` so they're unit testable without Discord
+- [x] [locked] Test baseline — `node --test` runner; extract `isSilent`/`formatTranscript`/`pushTranscriptEntry`/settings-resolution into `lib/` so they're unit testable without Discord
 - [ ] [gate] Live-tune ambient reply cadence (dev notes #17) — test in a real multi-person call; adjust `lullThresholdMs`, `AMBIENT_COOLDOWN_MS`, `PER_USER_SILENCE_MS`, and the silence-bias wording in `prompt.txt` based on how it actually feels
 - [ ] [locked] Persistent text memory (SQLite via `better-sqlite3`) — `textMemory` currently resets on every restart
 
