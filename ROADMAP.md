@@ -11,7 +11,7 @@ See `AUTOMATION.md` for the protocol a scheduled run follows. See `DECISIONS.md`
 
 - [x] [locked] Test baseline — `node --test` runner; extract `isSilent`/`formatTranscript`/`pushTranscriptEntry`/settings-resolution into `lib/` so they're unit testable without Discord
 - [ ] [gate] Live-tune ambient reply cadence (dev notes #17) — test in a real multi-person call; adjust `lullThresholdMs`, `AMBIENT_COOLDOWN_MS`, `PER_USER_SILENCE_MS`, and the silence-bias wording in `prompt.txt` based on how it actually feels
-- [ ] [locked] Persistent text memory (SQLite via `better-sqlite3`) — `textMemory` currently resets on every restart
+- [x] [locked] Persistent text memory (SQLite via built-in `node:sqlite`, not `better-sqlite3` — see `DECISIONS.md`) — `textMemory` no longer resets on restart
 
 ## Next
 

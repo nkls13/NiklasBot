@@ -21,6 +21,7 @@ process.env.FFMPEG_PATH = ffmpegPath; // prism-media / @discordjs/voice use this
 const OpenAI = require("openai");
 const { resolveSettings } = require("./lib/settings");
 const { SILENT_TOKEN, isSilent, formatTranscript, pushTranscriptEntry } = require("./lib/voiceReply");
+const { createTextMemoryStore } = require("./lib/textMemoryStore");
 
 // OpenAI is used only for TTS (tts-1)
 const openai = new OpenAI({
@@ -164,7 +165,9 @@ setInterval(() => {
 // One entry per guild currently in a call. Replaces the old fixed-interval
 // recording loop: listening is continuous and event-driven instead.
 const voiceSessions = new Map();
-const textMemory = new Map();
+// SQLite-backed (lib/textMemoryStore.js) so chat history survives a restart —
+// the old in-memory Map here lost it every time the process restarted.
+const textMemoryStore = createTextMemoryStore("textMemory.sqlite");
 const textCooldowns = new Map(); // userId -> last used timestamp
 
 const TEXT_COOLDOWN_MS = 5000;
@@ -469,7 +472,7 @@ async function speak(connection, text, session = null) {
 
 async function askOpenAIText(promptText, guildId) {
   try {
-    const memory = textMemory.get(guildId) || [];
+    const memory = textMemoryStore.getMemory(guildId);
 
     const messages = [
       { role: "system", content: TEXT_SYSTEM_PROMPT },
@@ -485,10 +488,7 @@ async function askOpenAIText(promptText, guildId) {
 
     let botResponse = response.choices[0].message.content.trim().replace(/^Nikbot:\s*/i, '');
 
-    memory.push({ role: "user", content: promptText });
-    memory.push({ role: "assistant", content: botResponse });
-    if (memory.length > 40) memory.splice(0, memory.length - 40);
-    textMemory.set(guildId, memory);
+    textMemoryStore.appendExchange(guildId, promptText, botResponse);
 
     return botResponse;
   } catch (error) {
@@ -894,7 +894,7 @@ client.on('interactionCreate', async interaction => {
 
     else if (commandName === 'settings') {
       const voiceSession = voiceSessions.get(guildId);
-      const textMem = textMemory.get(guildId) || [];
+      const textMemCount = textMemoryStore.countMemory(guildId);
       const { lullThresholdMs } = getGuildSettings(guildId);
 
       const settingsMessage = `**Nikbot Settings**\n` +
@@ -904,7 +904,7 @@ client.on('interactionCreate', async interaction => {
         `• Always responds immediately when addressed by name\n\n` +
         `**Memory:**\n` +
         `• Voice: ${voiceSession ? voiceSession.transcript.length : 0} lines (clears on exit)\n` +
-        `• Text: ${textMem.length} messages (last 20 exchanges)\n\n` +
+        `• Text: ${textMemCount} messages, persisted (last 20 exchanges)\n\n` +
         `**Voice Session:** ${voiceSession ? 'Active' : 'Inactive'}\n` +
         `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`;
       await interaction.reply(settingsMessage);

@@ -23,6 +23,7 @@ audio/
 settings.json
 guildPrompts.json
 guildSettings.json
+textMemory.sqlite
 
 # Claude Code local session state
 .claude/

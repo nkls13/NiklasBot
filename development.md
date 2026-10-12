@@ -36,15 +36,14 @@ A single-file Discord bot in `index.js` with ambient voice AI, text chat, and Fo
 
 **#16 README out of sync** — Rewritten to match the current command set and ambient-listening behavior.
 
+**#5 In-memory text history resets on restart** — Replaced the `textMemory` Map with SQLite persistence (`lib/textMemoryStore.js`, using the built-in `node:sqlite` module — see `DECISIONS.md` for why `better-sqlite3` wasn't needed). Same 20-exchange window, survives restarts.
+
 ---
 
 ### ❌ Remaining
 
 **#1 Monolithic index.js** *(critical)*
 Everything still lives in one file. Phase 1 refactor (extract services, commands, events into `src/`) is deferred until other features stabilize.
-
-**#5 In-memory text history resets on restart** *(critical)*
-`textMemory` Map is lost on every restart. Needs SQLite persistence via `better-sqlite3`.
 
 **#10 Audio filename collision risk** *(minor)*
 PCM files use millisecond timestamps now — collision risk is negligible but not zero. Can append a random suffix if it ever causes issues.
@@ -83,9 +82,6 @@ Voice memory is cleared on clean stop but not on crash. Low priority since voice
 **Live-tune ambient cadence (#17)**
 Test in an actual call with multiple people; adjust `lullThresholdMs`, `AMBIENT_COOLDOWN_MS`, and the `prompt.txt` silence bias based on how it actually feels.
 
-**Persistent text memory (SQLite)**
-Use `better-sqlite3` to persist `textMemory` across restarts. Schema: `(guild_id, role, content, timestamp)`. Same 20-exchange window, survives restarts.
-
 ### Medium Term
 
 **Custom voice (cheap + fast)**
@@ -123,7 +119,7 @@ Simple Express status page: active guilds, current prompts, memory counts. Add c
 | `prism-media` | Opus decoding | Active |
 | `dotenv` | Env config | Active |
 | `gtts` | Google TTS | ✅ Removed |
-| `better-sqlite3` | Persistent memory | ❌ Not yet added |
+| `node:sqlite` (built-in) | Persistent text memory | Active |
 | `pino` | Structured logging | ❌ Not yet added |
 
 ---
