@@ -22,6 +22,12 @@ const OpenAI = require("openai");
 const { resolveSettings } = require("./lib/settings");
 const { SILENT_TOKEN, isSilent, formatTranscript, pushTranscriptEntry } = require("./lib/voiceReply");
 const { createTextMemoryStore } = require("./lib/textMemoryStore");
+const { createLogger } = require("./lib/logger");
+
+const logger = createLogger();
+// maybeRespondToAddress/checkForLull/speakWhenClear keep their raw console.*
+// calls — those three functions are the AUTOMATION.md hard boundary, so a
+// scheduled run leaves their bodies untouched, logging included.
 
 // OpenAI is used only for TTS (tts-1)
 const openai = new OpenAI({
@@ -39,14 +45,14 @@ ffmpeg.setFfmpegPath(ffmpegPath);
 // Ensure audio directory exists for Oracle VM compatibility
 if (!fs.existsSync('audio')) {
   fs.mkdirSync('audio', { recursive: true });
-  console.log('📁 Created audio directory');
+  logger.info('📁 Created audio directory');
 }
 
 function safeFileOperation(operation, errorMessage) {
   try {
     return operation();
   } catch (error) {
-    console.error(errorMessage, error);
+    logger.error(errorMessage, error);
     return null;
   }
 }
@@ -55,10 +61,10 @@ function safeDeleteFile(filePath, description) {
   try {
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
-      console.log(`🗑️ Cleaned up ${description}: ${filePath}`);
+      logger.info(`🗑️ Cleaned up ${description}: ${filePath}`);
     }
   } catch (error) {
-    console.error(`❌ Failed to delete ${description}:`, error);
+    logger.error(`❌ Failed to delete ${description}:`, error);
   }
 }
 
@@ -85,10 +91,10 @@ function loadGuildPrompts() {
       for (const [guildId, prompt] of Object.entries(saved)) {
         guildChangingPrompts.set(guildId, prompt);
       }
-      console.log(`📝 Loaded ${Object.keys(saved).length} guild-specific prompts`);
+      logger.info(`📝 Loaded ${Object.keys(saved).length} guild-specific prompts`);
     }
   } catch (error) {
-    console.error("❌ Failed to load guild prompts:", error.message);
+    logger.error("❌ Failed to load guild prompts:", error.message);
   }
 }
 
@@ -96,7 +102,7 @@ function saveGuildPrompts() {
   try {
     fs.writeFileSync("guildPrompts.json", JSON.stringify(Object.fromEntries(guildChangingPrompts), null, 2));
   } catch (error) {
-    console.error("❌ Failed to save guild prompts:", error.message);
+    logger.error("❌ Failed to save guild prompts:", error.message);
   }
 }
 
@@ -123,10 +129,10 @@ function loadGuildSettings() {
       for (const [guildId, s] of Object.entries(saved)) {
         guildSettings.set(guildId, s); // getGuildSettings() fills in defaults on read
       }
-      console.log(`⚙️ Loaded settings for ${Object.keys(saved).length} guilds`);
+      logger.info(`⚙️ Loaded settings for ${Object.keys(saved).length} guilds`);
     }
   } catch (error) {
-    console.error("❌ Failed to load guild settings:", error.message);
+    logger.error("❌ Failed to load guild settings:", error.message);
   }
 }
 
@@ -134,7 +140,7 @@ function saveGuildSettings() {
   try {
     fs.writeFileSync("guildSettings.json", JSON.stringify(Object.fromEntries(guildSettings), null, 2));
   } catch (error) {
-    console.error("❌ Failed to save guild settings:", error.message);
+    logger.error("❌ Failed to save guild settings:", error.message);
   }
 }
 
@@ -157,7 +163,7 @@ setInterval(() => {
       });
     }
   } catch (error) {
-    console.error("❌ Cleanup error:", error);
+    logger.error("❌ Cleanup error:", error);
   }
 }, 10 * 60 * 1000);
 
@@ -236,7 +242,7 @@ function startListening(connection, guildId) {
     }
 
     if (session.activeRecordings.has(userId)) return; // already capturing this person
-    beginUserRecording(guildId, userId).catch(e => console.error("beginUserRecording error:", e));
+    beginUserRecording(guildId, userId).catch(e => logger.error("beginUserRecording error:", e));
   });
 
   receiver.speaking.on("end", (userId) => {
@@ -244,10 +250,10 @@ function startListening(connection, guildId) {
   });
 
   session.lullWatcher = setInterval(() => {
-    checkForLull(guildId).catch(e => console.error("checkForLull error:", e));
+    checkForLull(guildId).catch(e => logger.error("checkForLull error:", e));
   }, LULL_CHECK_INTERVAL_MS);
 
-  console.log(`✅ Listening continuously in guild ${guildId}`);
+  logger.info(`✅ Listening continuously in guild ${guildId}`);
 }
 
 async function beginUserRecording(guildId, userId) {
@@ -260,7 +266,7 @@ async function beginUserRecording(guildId, userId) {
     const user = await client.users.fetch(userId);
     username = user.username;
   } catch (e) {
-    console.error(`Could not fetch username for ${userId}:`, e.message);
+    logger.error(`Could not fetch username for ${userId}:`, e.message);
   }
 
   const pcmPath = `audio/${username}-${Date.now()}.pcm`;
@@ -275,7 +281,7 @@ async function beginUserRecording(guildId, userId) {
 
   fileStream.on("finish", () => {
     session.activeRecordings.delete(userId);
-    finalizeUtterance(guildId, username, pcmPath).catch(e => console.error("finalizeUtterance error:", e));
+    finalizeUtterance(guildId, username, pcmPath).catch(e => logger.error("finalizeUtterance error:", e));
   });
 }
 
@@ -289,7 +295,7 @@ async function finalizeUtterance(guildId, username, pcmPath) {
   });
 
   if (!converted) {
-    console.error(`FFmpeg failed for ${username}`);
+    logger.error(`FFmpeg failed for ${username}`);
     safeDeleteFile(wavPath, "failed WAV file");
     safeDeleteFile(pcmPath, "failed PCM file");
     return;
@@ -299,7 +305,7 @@ async function finalizeUtterance(guildId, username, pcmPath) {
   try {
     text = await transcribeAudio(wavPath);
   } catch (e) {
-    console.error(`Transcription failed for ${username}:`, e.message);
+    logger.error(`Transcription failed for ${username}:`, e.message);
   } finally {
     safeDeleteFile(wavPath, "processed WAV file");
     safeDeleteFile(pcmPath, "processed PCM file");
@@ -307,7 +313,7 @@ async function finalizeUtterance(guildId, username, pcmPath) {
 
   text = text.trim();
   if (!text) return;
-  console.log(`Transcribed ${username}: "${text}"`);
+  logger.info(`Transcribed ${username}: "${text}"`);
 
   const session = voiceSessions.get(guildId);
   if (!session) return; // session ended while we were transcribing
@@ -436,7 +442,7 @@ async function transcribeAudio(audioPath) {
 // the instant someone starts talking.
 async function speak(connection, text, session = null) {
   const ttsPath = `audio/tts-${Date.now()}.mp3`;
-  console.log(`Speaking: ${text}`);
+  logger.info(`Speaking: ${text}`);
 
   const mp3Response = await openai.audio.speech.create({
     model: "tts-1",
@@ -464,7 +470,7 @@ async function speak(connection, text, session = null) {
 
     ttsPlayer.on("error", (err) => {
       clearSession();
-      console.error("TTS Playback Error:", err);
+      logger.error("TTS Playback Error:", err);
       reject(err);
     });
   });
@@ -492,7 +498,7 @@ async function askOpenAIText(promptText, guildId) {
 
     return botResponse;
   } catch (error) {
-    console.error("Groq text error:", error.response?.data || error.message);
+    logger.error("Groq text error:", error.response?.data || error.message);
     return "Failed to contact Groq.";
   }
 }
@@ -556,7 +562,7 @@ async function getFortniteShop() {
           if (description) shopMessage += `   *${description}*\n`;
           shopMessage += `\n`;
         } catch (itemError) {
-          console.log('Error processing BR item:', itemError);
+          logger.info('Error processing BR item:', itemError);
         }
       });
     }
@@ -569,7 +575,7 @@ async function getFortniteShop() {
           const name = cosmeticId.replace('Character_', '').replace(/_/g, ' ');
           shopMessage += `• **${name}** • Free (LEGO Fortnite)\n`;
         } catch (itemError) {
-          console.log('Error processing LEGO item:', itemError);
+          logger.info('Error processing LEGO item:', itemError);
         }
       });
       shopMessage += `\n`;
@@ -602,7 +608,7 @@ async function getFortniteShop() {
 
           shopMessage += `[${rarity.toUpperCase()}] **${name}**${priceInfo}\n`;
         } catch (itemError) {
-          console.log('Error processing car item:', itemError);
+          logger.info('Error processing car item:', itemError);
         }
       });
       shopMessage += `\n`;
@@ -621,7 +627,7 @@ async function getFortniteShop() {
     return shopMessage;
 
   } catch (error) {
-    console.error("Fortnite shop fetch error:", error);
+    logger.error("Fortnite shop fetch error:", error);
 
     try {
       const fallbackResponse = await fetch('https://fnbr.co/api/shop', {
@@ -637,7 +643,7 @@ async function getFortniteShop() {
         }
       }
     } catch (fallbackError) {
-      console.log("Fallback API also failed:", fallbackError);
+      logger.info("Fallback API also failed:", fallbackError);
     }
 
     return `**Fortnite Cosmetics**\n` +
@@ -727,25 +733,25 @@ async function registerSlashCommands() {
       try {
         await guild.commands.set(SLASH_COMMANDS);
         registeredGuilds.add(guildId);
-        console.log(`✅ Slash commands registered for guild: ${guild.name} (${guildId})`);
+        logger.info(`✅ Slash commands registered for guild: ${guild.name} (${guildId})`);
       } catch (error) {
-        console.error(`❌ Error registering commands for guild ${guild.name}:`, error);
+        logger.error(`❌ Error registering commands for guild ${guild.name}:`, error);
       }
     }
-    console.log('✅ All guild slash commands registered!');
+    logger.info('✅ All guild slash commands registered!');
   } catch (error) {
-    console.error('❌ Error registering slash commands:', error);
+    logger.error('❌ Error registering slash commands:', error);
   }
 }
 
 client.on('guildCreate', async (guild) => {
-  console.log(`Bot joined new guild: ${guild.name}`);
+  logger.info(`Bot joined new guild: ${guild.name}`);
   try {
     await guild.commands.set(SLASH_COMMANDS);
     registeredGuilds.add(guild.id);
-    console.log(`✅ Slash commands registered for new guild: ${guild.name}`);
+    logger.info(`✅ Slash commands registered for new guild: ${guild.name}`);
   } catch (error) {
-    console.error(`❌ Error registering commands for new guild ${guild.name}:`, error);
+    logger.error(`❌ Error registering commands for new guild ${guild.name}:`, error);
   }
 });
 
@@ -794,7 +800,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply();
         interactionDeferred = true;
       } catch (e) {
-        console.log('⚠️ Interaction expired before deferReply — joining anyway');
+        logger.info('⚠️ Interaction expired before deferReply — joining anyway');
       }
 
       const channel = interaction.channel;
@@ -816,9 +822,9 @@ client.on('interactionCreate', async interaction => {
             entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
           ]);
           await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
-          console.log(`🔄 Reconnected to voice in guild ${guildId}`);
+          logger.info(`🔄 Reconnected to voice in guild ${guildId}`);
         } catch {
-          console.log(`❌ Could not reconnect in guild ${guildId}, cleaning up`);
+          logger.info(`❌ Could not reconnect in guild ${guildId}, cleaning up`);
           teardownVoiceSession(guildId);
           try { connection.destroy(); } catch {}
           try {
@@ -839,7 +845,7 @@ client.on('interactionCreate', async interaction => {
                      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`
           });
         } catch (e) {
-          console.log('⚠️ Could not send join confirmation');
+          logger.info('⚠️ Could not send join confirmation');
         }
       }
 
@@ -934,7 +940,7 @@ client.on('interactionCreate', async interaction => {
     }
 
   } catch (error) {
-    console.error('Slash command error:', error);
+    logger.error('Slash command error:', error);
     try {
       if (interaction.deferred) {
         await interaction.editReply('Sorry, there was an error processing that command.');
@@ -946,8 +952,8 @@ client.on('interactionCreate', async interaction => {
 });
 
 client.login(process.env.DISCORD_TOKEN).then(async () => {
-  console.log("Bot login attempt successful.");
+  logger.info("Bot login attempt successful.");
   await registerSlashCommands();
 }).catch(err => {
-  console.error("Login failed:", err);
+  logger.error("Login failed:", err);
 });

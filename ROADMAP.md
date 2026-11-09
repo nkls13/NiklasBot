@@ -15,7 +15,7 @@ See `AUTOMATION.md` for the protocol a scheduled run follows. See `DECISIONS.md`
 
 ## Next
 
-- [ ] [locked] Structured logging (`pino`) — replace `console.log`/`console.error` with real log levels, opportunistic as other work touches affected code
+- [x] [locked] Structured logging — `lib/logger.js`, a leveled wrapper over `console` (no new dependency — not `pino`, see `DECISIONS.md`); wired into `index.js` everywhere except the three `console.*` calls inside the hard-boundary functions, which stay untouched on purpose
 - [ ] [locked] Modular `src/` structure (dev notes #1) — extract services/commands/events out of `index.js`; do this incrementally as other `[locked]` tasks touch the file rather than as one big-bang rewrite
 - [ ] [gate] Custom voice — only revisit after the ambient cadence feels right (above). Cartesia Sonic is the pick if/when this becomes a priority (cheap, ~40ms latency, real cloning); currently stays on OpenAI `tts-1` by choice, not because it's blocked
 - [ ] [provisional] Web dashboard (Express status page: active guilds, current prompts, memory counts)
